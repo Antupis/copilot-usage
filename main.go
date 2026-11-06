@@ -32,6 +32,7 @@ type config struct {
 	BarWidth int
 	ASCII    bool
 	Once     bool
+	Oneline  bool
 }
 
 type apiResponse struct {
@@ -190,6 +191,7 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	flags.IntVar(&result.BarWidth, "width", 0, "progress bar width (default: based on COLUMNS, or 40)")
 	flags.BoolVar(&result.ASCII, "ascii", false, "use ASCII progress bars instead of Unicode blocks")
 	flags.BoolVar(&result.Once, "once", false, "query once, print the dashboard, and exit")
+	flags.BoolVar(&result.Oneline, "oneline", false, "query once, print a single line of key percentages, and exit")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: copilot-usage [options]")
 		fmt.Fprintln(stderr, "")
@@ -198,6 +200,9 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
+	}
+	if result.Oneline {
+		result.Once = true
 	}
 	if flags.NArg() != 0 {
 		return config{}, fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
@@ -332,6 +337,10 @@ func runOnce(ctx context.Context, fetcher usageFetcher, cfg config, out io.Write
 	if data.FetchedAt.IsZero() {
 		data.FetchedAt = time.Now().UTC()
 	}
+	if cfg.Oneline {
+		_, err := io.WriteString(out, onelineText(data, time.Now()))
+		return err
+	}
 	state := appState{
 		Data:          &data,
 		LastSuccessAt: data.FetchedAt,
@@ -373,13 +382,14 @@ func dashboardText(state appState, now time.Time, cfg config) string {
 		resetAt = state.Data.ResetAt
 	}
 	monthPercent, periodStart, periodEnd, fallback := monthProgress(now, resetAt)
-	fmt.Fprintf(&output, "Month elapsed  %s %5.1f%%\n", progressBar(monthPercent, cfg.BarWidth, cfg.ASCII), monthPercent*100)
 	if fallback {
 		fmt.Fprintf(&output, "Period: %s to %s UTC (estimated)\n", periodStart.Format("2006-01-02"), periodEnd.Format("2006-01-02"))
 	} else {
 		fmt.Fprintf(&output, "Period: %s to %s UTC\n", periodStart.Format("2006-01-02"), periodEnd.Format("2006-01-02"))
 	}
+	fmt.Fprintf(&output, "Month elapsed  %s %5.1f%%\n", progressBar(monthPercent, cfg.BarWidth, cfg.ASCII), monthPercent*100)
 
+	usageRaw, usageAvailable := 0.0, false
 	if state.Data == nil || !state.Data.Quota.HasQuota {
 		fmt.Fprintf(&output, "Premium usage  %s unavailable\n", progressBar(0, cfg.BarWidth, cfg.ASCII))
 	} else if state.Data.Quota.Unlimited {
@@ -390,8 +400,34 @@ func dashboardText(state appState, now time.Time, cfg config) string {
 			fmt.Fprintf(&output, "Premium usage  %s unavailable\n", progressBar(0, cfg.BarWidth, cfg.ASCII))
 		} else {
 			fmt.Fprintf(&output, "Premium usage  %s %5.1f%%\n", progressBar(usagePercent, cfg.BarWidth, cfg.ASCII), usagePercent*100)
+			usageRaw, usageAvailable = usageRatio(state.Data.Quota)
 		}
 	}
+
+	elapsed := now.UTC().Sub(periodStart)
+	writeProjection := func(label string, target float64) {
+		if !usageAvailable {
+			fmt.Fprintf(&output, "Projected at %s: unavailable\n", label)
+			return
+		}
+		projected, ok := projectUsage(usageRaw, monthPercent, target, elapsed)
+		if !ok {
+			fmt.Fprintf(&output, "Projected at %s: n/a\n", label)
+			return
+		}
+		if entitlement := state.Data.Quota.Entitlement; entitlement > 0 {
+			fmt.Fprintf(&output, "Projected at %s: %.1f%% (%s / %s credits)\n", label, projected*100, formatNumber(math.Round(projected*entitlement)), formatNumber(entitlement))
+		} else {
+			fmt.Fprintf(&output, "Projected at %s: %.1f%%\n", label, projected*100)
+		}
+	}
+	writeProjection("period end", 1)
+
+	weekPercent, checkpoint := weekBudget(now, resetAt)
+	output.WriteString("\n")
+	fmt.Fprintf(&output, "Weekly Checkpoint: %s UTC\n", checkpoint.Format("2006-01-02 15:04"))
+	fmt.Fprintf(&output, "Weekly target  %s %5.1f%%\n", progressBar(weekPercent, cfg.BarWidth, cfg.ASCII), weekPercent*100)
+	writeProjection("checkpoint", weekPercent)
 
 	output.WriteString("\n")
 	if state.Data != nil && state.Data.Quota.HasQuota && !state.Data.Quota.Unlimited && state.Data.Quota.Entitlement > 0 {
@@ -446,6 +482,21 @@ func dashboardText(state appState, now time.Time, cfg config) string {
 	return output.String()
 }
 
+// onelineText returns usage, month elapsed, weekly target and projected
+// period-end usage on one line, for status bars and scripts.
+func onelineText(data usageData, now time.Time) string {
+	monthPercent, periodStart, _, _ := monthProgress(now, data.ResetAt)
+	weekPercent, _ := weekBudget(now, data.ResetAt)
+	used, projected := "n/a", "n/a"
+	if ratio, ok := usageRatio(data.Quota); ok && data.Quota.HasQuota {
+		used = fmt.Sprintf("%.1f%%", ratio*100)
+		if value, ok := projectUsage(ratio, monthPercent, 1, now.UTC().Sub(periodStart)); ok {
+			projected = fmt.Sprintf("%.1f%%", value*100)
+		}
+	}
+	return fmt.Sprintf("U %s M %.1f%% W %.1f%% P %s\n", used, monthPercent*100, weekPercent*100, projected)
+}
+
 func monthProgress(now, resetAt time.Time) (float64, time.Time, time.Time, bool) {
 	start, end, fallback := monthPeriod(now, resetAt)
 	return progressBetween(now, start, end), start, end, fallback
@@ -476,15 +527,58 @@ func progressBetween(now, start, end time.Time) float64 {
 	return progress
 }
 
+// weekCheckpoint returns the earlier of the next Sunday 23:00 UTC and the
+// period's last day at 23:00 UTC. Once the last day's checkpoint has passed,
+// it returns the period end.
+func weekCheckpoint(now, start, end time.Time) time.Time {
+	now, end = now.UTC(), end.UTC()
+	lastDay := end.AddDate(0, 0, -1)
+	monthCheckpoint := time.Date(lastDay.Year(), lastDay.Month(), lastDay.Day(), 23, 0, 0, 0, time.UTC)
+	if !monthCheckpoint.After(start) || !now.Before(monthCheckpoint) {
+		return end
+	}
+
+	daysUntilSunday := (7 - int(now.Weekday())) % 7
+	sunday := time.Date(now.Year(), now.Month(), now.Day()+daysUntilSunday, 23, 0, 0, 0, time.UTC)
+	if !now.Before(sunday) {
+		sunday = sunday.AddDate(0, 0, 7)
+	}
+	if sunday.Before(monthCheckpoint) {
+		return sunday
+	}
+	return monthCheckpoint
+}
+
+// weekBudget returns the share of the period elapsed at this week's checkpoint.
+func weekBudget(now, resetAt time.Time) (float64, time.Time) {
+	start, end, _ := monthPeriod(now, resetAt)
+	checkpoint := weekCheckpoint(now, start, end)
+	return progressBetween(checkpoint, start, end), checkpoint
+}
+
+// projectUsage extrapolates usage linearly from the average rate since the
+// period start. It is unavailable during the first day, when the rate is noise.
+func projectUsage(usage, elapsedFraction, targetFraction float64, elapsed time.Duration) (float64, bool) {
+	if elapsed < 24*time.Hour || elapsedFraction <= 0 {
+		return 0, false
+	}
+	return usage * targetFraction / elapsedFraction, true
+}
+
 func usageProgress(q quota) (float64, bool) {
+	ratio, available := usageRatio(q)
+	return clamp01(ratio), available
+}
+
+func usageRatio(q quota) (float64, bool) {
 	if q.Unlimited {
 		return 0, false
 	}
 	if q.Entitlement > 0 {
-		return clamp01(q.CreditsUsed / q.Entitlement), true
+		return q.CreditsUsed / q.Entitlement, true
 	}
 	if q.HasPercent && q.PercentRemaining >= 0 && q.PercentRemaining <= 100 {
-		return clamp01(1 - q.PercentRemaining/100), true
+		return 1 - q.PercentRemaining/100, true
 	}
 	return 0, false
 }
